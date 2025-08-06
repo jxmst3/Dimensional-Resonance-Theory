@@ -1,0 +1,818 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import (Slider, Button, RadioButtons, CheckButtons, 
+                               TextBox, RangeSlider)
+from scipy.ndimage import gaussian_filter, label, center_of_mass
+from scipy.stats import entropy
+from scipy.fft import fft2, fftshift
+from scipy.signal import stft
+from scipy.interpolate import griddata
+import matplotlib as mpl
+from matplotlib.animation import FuncAnimation
+import matplotlib.gridspec as gridspec
+from matplotlib import patches
+from mpl_toolkits.mplot3d import Axes3D
+import pandas as pd
+import imageio
+import os
+from datetime import datetime
+import torch
+import torch.nn as nn
+from sklearn.cluster import DBSCAN
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from astropy.io import fits
+import requests
+from io import BytesIO
+import base64
+
+# Configure plot aesthetics
+mpl.rcParams['font.family'] = 'sans-serif'
+plt.style.use('dark_background')
+
+# --------------------------
+# NEURAL NETWORK COMPONENTS
+# --------------------------
+
+# Autoencoder for latent space projection
+class Autoencoder(nn.Module):
+    def __init__(self):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64*37*37, 128),
+            nn.ReLU(),
+            nn.Linear(128, 32)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(32, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64*37*37),
+            nn.ReLU(),
+            nn.Unflatten(1, (64, 37, 37)),
+            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 1, 3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        latent = self.encoder(x)
+        decoded = self.decoder(latent)
+        return decoded, latent
+
+# Initialize autoencoder
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+autoencoder = Autoencoder().to(device)
+
+# --------------------------
+# SIMULATION CORE
+# --------------------------
+
+class NaomiSOLSimulator:
+    def __init__(self):
+        # Create figure
+        self.fig = plt.figure(figsize=(18, 14), facecolor='#0f0f1a')
+        self.setup_layout()
+        
+        # Initialize parameters
+        self.init_parameters()
+        
+        # Setup plots
+        self.setup_plots()
+        
+        # Setup controls
+        self.setup_controls()
+        
+        # Initialize neural network
+        self.latent_history = []
+        self.pattern_history = []
+        
+        # Initialize frame buffer
+        self.frame_buffer = []
+        self.current_frame = 0
+        
+        # Setup event handlers
+        self.connect_events()
+        
+        # Start animation
+        self.start_animation()
+    
+    def setup_layout(self):
+        """Create complex grid layout for all components"""
+        self.gs = gridspec.GridSpec(6, 6, figure=self.fig)
+        
+        # Main visualization area
+        self.ax_main = self.fig.add_subplot(self.gs[0:3, 0:3])
+        
+        # Spectral analysis
+        self.ax_spectrum = self.fig.add_subplot(self.gs[0:2, 3:5])
+        
+        # 3D projection
+        self.ax_3d = self.fig.add_subplot(self.gs[0:3, 5:6], projection='3d')
+        
+        # Phase field
+        self.ax_phase = self.fig.add_subplot(self.gs[3:4, 0:2])
+        
+        # Entropy map
+        self.ax_entropy = self.fig.add_subplot(self.gs[3:4, 2:4])
+        
+        # Time coherence chart
+        self.ax_time = self.fig.add_subplot(self.gs[3:4, 4:6])
+        
+        # Latent space projection
+        self.ax_latent = self.fig.add_subplot(self.gs[4:6, 0:2])
+        
+        # Vortex detection
+        self.ax_vortex = self.fig.add_subplot(self.gs[4:6, 2:4])
+        
+        # Field line tracer
+        self.ax_field = self.fig.add_subplot(self.gs[4:6, 4:6])
+        
+        # Control panel area
+        self.ax_controls = self.fig.add_subplot(self.gs[5, 0:6])
+        self.ax_controls.set_axis_off()
+    
+    def init_parameters(self):
+        """Initialize simulation parameters"""
+        # Grid setup
+        self.grid_size = 256
+        self.x = np.linspace(-5, 5, self.grid_size)
+        self.y = np.linspace(-5, 5, self.grid_size)
+        self.X, self.Y = np.meshgrid(self.x, self.y)
+        
+        # Oscillator parameters
+        self.num_sources = 12
+        self.source_positions = np.random.rand(self.num_sources, 2) * 8 - 4
+        self.source_phases = np.random.rand(self.num_sources) * 2 * np.pi
+        self.source_strengths = np.ones(self.num_sources)
+        self.source_colors = plt.cm.hsv(np.linspace(0, 1, self.num_sources))
+        
+        # Physics parameters
+        self.wavelength = 1.2
+        self.coherence = 0.85
+        self.node_threshold = 0.25
+        self.time_shift = 0.0
+        self.simulation_speed = 1.0
+        self.mode = 'intensity'
+        self.entropy_overlay = False
+        self.phase_drift_enabled = False
+        self.phase_drift_rate = 0.01
+        self.noise_level = 0.0
+        self.coupling_strength = 0.0
+        self.recording = False
+        self.coherence_history = []
+        self.entropy_history = []
+        self.dark_node_history = []
+        
+        # Cosmic data
+        self.cosmic_data = None
+    
+    def setup_plots(self):
+        """Initialize all visualization components"""
+        # Initial field calculation
+        self.field = self.update_field()
+        self.dark_nodes, self.intensity = self.detect_dark_nodes(self.field)
+        self.phase_field = np.angle(self.field)
+        self.entropy_map = self.compute_entropy(self.field)
+        
+        # Main plot
+        if self.mode == 'intensity':
+            self.main_plot = self.ax_main.imshow(
+                self.intensity, extent=[-5, 5, -5, 5],
+                cmap='plasma', origin='lower',
+                vmin=0, vmax=np.percentile(self.intensity, 99)
+        else:
+            self.main_plot = self.ax_main.imshow(
+                self.phase_field, extent=[-5, 5, -5, 5],
+                cmap='hsv', origin='lower', vmin=-np.pi, vmax=np.pi)
+        
+        # Entropy overlay
+        self.entropy_overlay_plot = self.ax_main.imshow(
+            self.entropy_map, extent=[-5, 5, -5, 5],
+            cmap='viridis', origin='lower', 
+            alpha=0.5 if self.entropy_overlay else 0.0,
+            vmin=0, vmax=1)
+        
+        # Dark nodes and sources
+        self.node_plot = self.ax_main.contour(
+            self.X, self.Y, self.dark_nodes, 
+            levels=[0.5], colors='cyan', linewidths=1.5)
+        self.source_plot = self.ax_main.scatter(
+            self.source_positions[:, 0], self.source_positions[:, 1],
+            s=120, c=self.source_colors, edgecolors='white', zorder=10)
+        self.center_plot = self.ax_main.plot(
+            [], [], 'wo', markersize=6, markeredgecolor='cyan', alpha=0.7)[0]
+        
+        # Phase arrows
+        arrow_scale = 0.3
+        U = np.cos(self.phase_field) * arrow_scale
+        V = np.sin(self.phase_field) * arrow_scale
+        skip = (slice(None, None, 15), slice(None, None, 15))
+        self.phase_quiver = self.ax_main.quiver(
+            self.X[skip], self.Y[skip], U[skip], V[skip], 
+            scale=20, color='white', alpha=0.5)
+        
+        # Phase plot
+        self.phase_plot = self.ax_phase.imshow(
+            self.phase_field, extent=[-5, 5, -5, 5],
+            cmap='hsv', origin='lower', vmin=-np.pi, vmax=np.pi)
+        self.ax_phase.set_title('PHASE FIELD', fontsize=10, color='#aaddff')
+        self.ax_phase.set_xticks([])
+        self.ax_phase.set_yticks([])
+        
+        # Entropy plot
+        self.entropy_plot = self.ax_entropy.imshow(
+            self.entropy_map, extent=[-5, 5, -5, 5],
+            cmap='viridis', origin='lower', vmin=0, vmax=1)
+        self.ax_entropy.set_title('ENTROPY MAP', fontsize=10, color='#aaddff')
+        self.ax_entropy.set_xticks([])
+        self.ax_entropy.set_yticks([])
+        
+        # Time coherence chart
+        self.time_line, = self.ax_time.plot([], [], 'c-', linewidth=2, label='Coherence')
+        self.entropy_line, = self.ax_time.plot([], [], 'm-', linewidth=2, label='Entropy')
+        self.ax_time.set_title('COHERENCE STABILITY', fontsize=10, color='#aaddff')
+        self.ax_time.set_xlabel('Time Step', color='#88ccff', fontsize=8)
+        self.ax_time.set_ylabel('Value', color='#88ccff', fontsize=8)
+        self.ax_time.set_ylim(0, 1)
+        self.ax_time.grid(alpha=0.2, color='white', linestyle='--')
+        self.ax_time.legend(loc='upper right', fontsize=8)
+        
+        # Spectral analysis
+        self.spectrum = self.compute_spectrum()
+        self.spectrum_plot = self.ax_spectrum.imshow(
+            np.log1p(np.abs(self.spectrum)), 
+            cmap='inferno', origin='lower', 
+            extent=[-np.pi, np.pi, -np.pi, np.pi])
+        self.ax_spectrum.set_title('SPECTRAL ANALYSIS', fontsize=10, color='#aaddff')
+        self.ax_spectrum.set_xticks([])
+        self.ax_spectrum.set_yticks([])
+        
+        # 3D projection
+        self.plot_3d_surface()
+        
+        # Vortex detection
+        self.vortex_points = self.detect_vortices()
+        self.ax_vortex.clear()
+        self.vortex_plot = self.ax_vortex.imshow(
+            self.intensity, extent=[-5, 5, -5, 5],
+            cmap='gray', origin='lower')
+        self.ax_vortex.scatter(
+            self.vortex_points[:,0], self.vortex_points[:,1],
+            s=50, c='red', marker='x')
+        self.ax_vortex.set_title('PHASE VORTEX DETECTION', fontsize=10, color='#aaddff')
+        self.ax_vortex.set_xticks([])
+        self.ax_vortex.set_yticks([])
+        
+        # Field line tracer
+        self.plot_field_lines()
+        
+        # Latent space
+        self.plot_latent_space()
+        
+        # Add borders
+        for ax in [self.ax_phase, self.ax_entropy, self.ax_spectrum, 
+                  self.ax_vortex, self.ax_field, self.ax_latent]:
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#66bbff')
+                spine.set_linewidth(1)
+        
+        # Main title
+        self.ax_main.set_title('NAOMI SOL 2.0: QUANTUM VACUUM SIMULATOR', 
+                              fontsize=16, color='#aaddff', pad=10)
+        self.ax_main.set_xlabel('Space Dimension X', color='#88ccff', fontsize=10)
+        self.ax_main.set_ylabel('Space Dimension Y', color='#88ccff', fontsize=10)
+        self.ax_main.grid(alpha=0.1, color='white', linestyle='--')
+        
+        # Cosmic background
+        background = np.random.rand(self.grid_size, self.grid_size) * 0.05
+        self.ax_main.imshow(background, extent=[-5,5,-5,5], cmap='gray', alpha=0.2, origin='lower')
+    
+    def setup_controls(self):
+        """Create all control elements"""
+        # Create slider axes
+        self.ax_coherence = plt.axes([0.05, 0.05, 0.15, 0.03], facecolor='#1a1a2a')
+        self.ax_wavelength = plt.axes([0.05, 0.09, 0.15, 0.03], facecolor='#1a1a2a')
+        self.ax_threshold = plt.axes([0.05, 0.13, 0.15, 0.03], facecolor='#1a1a2a')
+        self.ax_speed = plt.axes([0.05, 0.17, 0.15, 0.03], facecolor='#1a1a2a')
+        self.ax_drift = plt.axes([0.05, 0.21, 0.15, 0.03], facecolor='#1a1a2a')
+        self.ax_noise = plt.axes([0.05, 0.25, 0.15, 0.03], facecolor='#1a1a2a')
+        self.ax_coupling = plt.axes([0.05, 0.29, 0.15, 0.03], facecolor='#1a1a2a')
+        
+        # Create sliders
+        self.slider_coherence = Slider(self.ax_coherence, 'Coherence', 0.1, 1.0, 
+                                      valinit=self.coherence, color='#66bbff')
+        self.slider_wavelength = Slider(self.ax_wavelength, 'Wavelength', 0.5, 3.0, 
+                                       valinit=self.wavelength, color='#ff66aa')
+        self.slider_threshold = Slider(self.ax_threshold, 'Node Threshold', 0.05, 0.5, 
+                                      valinit=self.node_threshold, color='#66ffcc')
+        self.slider_speed = Slider(self.ax_speed, 'Simulation Speed', 0.1, 5.0, 
+                                  valinit=self.simulation_speed, color='#ffcc66')
+        self.slider_drift = Slider(self.ax_drift, 'Phase Drift', 0.0, 0.1, 
+                                  valinit=self.phase_drift_rate, color='#cc66ff')
+        self.slider_noise = Slider(self.ax_noise, 'Noise Level', 0.0, 0.5, 
+                                  valinit=self.noise_level, color='#ff6666')
+        self.slider_coupling = Slider(self.ax_coupling, 'Coupling Strength', 0.0, 1.0, 
+                                     valinit=self.coupling_strength, color='#66ff66')
+        
+        # Create buttons
+        self.randomize_btn = Button(plt.axes([0.22, 0.05, 0.08, 0.04]), 'Randomize',
+                                   color='#2a2a4a', hovercolor='#3a3a6a')
+        self.record_btn = Button(plt.axes([0.22, 0.10, 0.08, 0.04]), 'Record',
+                                color='#2a2a4a', hovercolor='#3a3a6a')
+        self.save_btn = Button(plt.axes([0.22, 0.15, 0.08, 0.04]), 'Save',
+                              color='#2a2a4a', hovercolor='#3a3a6a')
+        self.cosmic_btn = Button(plt.axes([0.22, 0.20, 0.08, 0.04]), 'Cosmic Data',
+                                color='#2a2a4a', hovercolor='#3a3a6a')
+        self.perturb_btn = Button(plt.axes([0.22, 0.25, 0.08, 0.04]), 'Perturb Mode',
+                                 color='#2a2a4a', hovercolor='#3a3a6a')
+        
+        # Create checkboxes
+        self.check_ax = plt.axes([0.32, 0.05, 0.12, 0.20], facecolor='#1a1a2a')
+        self.check = CheckButtons(self.check_ax, 
+                                ['Entropy Overlay', 'Phase Drift', 'AI Detection', 
+                                 'Vortex Tracking', 'Field Lines', '3D Surface'],
+                                [self.entropy_overlay, self.phase_drift_enabled, 
+                                 False, False, False, False])
+        
+        # Create playback controls
+        self.playback_ax = plt.axes([0.46, 0.05, 0.30, 0.04], facecolor='#1a1a2a')
+        self.playback_slider = Slider(self.playback_ax, 'Time', 0, 100, valinit=0,
+                                     color='#8888ff', track_color='#0a0a1a')
+        self.play_btn = Button(plt.axes([0.78, 0.05, 0.04, 0.04]), '▶',
+                              color='#2a2a4a', hovercolor='#3a3a6a')
+        self.pause_btn = Button(plt.axes([0.83, 0.05, 0.04, 0.04]), '❚❚',
+                               color='#2a2a4a', hovercolor='#3a3a6a')
+        
+        # Create textbox for notes
+        self.text_ax = plt.axes([0.46, 0.10, 0.41, 0.15], facecolor='#1a1a2a')
+        self.text_box = TextBox(self.text_ax, 'Logbook:', 
+                              initial="Experiment notes...", 
+                              label_pad=0.1)
+    
+    def connect_events(self):
+        """Connect all event handlers"""
+        # Sliders
+        self.slider_coherence.on_changed(self.update_params)
+        self.slider_wavelength.on_changed(self.update_params)
+        self.slider_threshold.on_changed(self.update_params)
+        self.slider_speed.on_changed(self.update_params)
+        self.slider_drift.on_changed(self.update_params)
+        self.slider_noise.on_changed(self.update_params)
+        self.slider_coupling.on_changed(self.update_params)
+        
+        # Buttons
+        self.randomize_btn.on_clicked(self.randomize_lattice)
+        self.record_btn.on_clicked(self.toggle_recording)
+        self.save_btn.on_clicked(self.save_experiment)
+        self.cosmic_btn.on_clicked(self.load_cosmic_data)
+        self.perturb_btn.on_clicked(self.activate_perturb_mode)
+        self.play_btn.on_clicked(self.play_animation)
+        self.pause_btn.on_clicked(self.pause_animation)
+        
+        # Checkboxes
+        self.check.on_clicked(self.toggle_features)
+        
+        # Playback
+        self.playback_slider.on_changed(self.set_frame)
+        
+        # Textbox
+        self.text_box.on_submit(self.add_log_entry)
+        
+        # Click event for perturbations
+        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+    
+    # --------------------------
+    # PHYSICS ENGINE
+    # --------------------------
+    
+    def wave_fn(self, x, y, src_x, src_y, strength, phase, time_shift):
+        """Wave function with noise and coupling"""
+        r = np.sqrt((x - src_x)**2 + (y - src_y)**2)
+        phase_noise = self.noise_level * np.random.normal(0, 1)
+        return strength * np.exp(1j * (2 * np.pi * r / self.wavelength + phase + time_shift + phase_noise))
+    
+    def update_field(self):
+        """Update field with oscillator coupling"""
+        field = np.zeros((self.grid_size, self.grid_size), dtype=complex)
+        
+        # Apply Kuramoto-style coupling
+        if self.coupling_strength > 0:
+            mean_phase = np.mean(np.sin(self.source_phases))
+            for i in range(self.num_sources):
+                self.source_phases[i] += self.coupling_strength * mean_phase
+        
+        for i in range(self.num_sources):
+            field += self.wave_fn(
+                self.X, self.Y,
+                self.source_positions[i, 0],
+                self.source_positions[i, 1],
+                self.source_strengths[i],
+                self.source_phases[i],
+                self.time_shift
+            )
+        return field * self.coherence
+    
+    def detect_dark_nodes(self, field):
+        intensity = np.abs(field) ** 2
+        norm_intensity = intensity / np.max(intensity)
+        node_map = (norm_intensity < self.node_threshold).astype(float)
+        smoothed = gaussian_filter(node_map, sigma=2)
+        return smoothed > 0.5, norm_intensity
+    
+    def compute_entropy(self, field, window_size=15):
+        """Compute local entropy of phase field"""
+        phase = np.angle(field)
+        entropy_map = np.zeros_like(phase)
+        pad = window_size // 2
+        padded = np.pad(phase, pad, mode='wrap')
+        
+        for i in range(phase.shape[0]):
+            for j in range(phase.shape[1]):
+                window = padded[i:i+window_size, j:j+window_size]
+                hist, _ = np.histogram(window, bins=16, range=(-np.pi, np.pi))
+                prob = hist / hist.sum()
+                entropy_map[i, j] = entropy(prob)
+        
+        return entropy_map / np.max(entropy_map)
+    
+    def compute_spectrum(self):
+        """Compute 2D Fourier transform of intensity field"""
+        return fftshift(fft2(self.intensity))
+    
+    def detect_vortices(self):
+        """Detect phase vortices using gradient winding"""
+        phase = self.phase_field
+        grad_x, grad_y = np.gradient(phase)
+        vortices = []
+        
+        for i in range(1, phase.shape[0]-1):
+            for j in range(1, phase.shape[1]-1):
+                # Check winding number
+                loop = [
+                    phase[i, j], phase[i, j+1], phase[i+1, j+1],
+                    phase[i+1, j], phase[i+1, j-1], phase[i, j-1],
+                    phase[i-1, j-1], phase[i-1, j], phase[i-1, j+1]
+                ]
+                winding = np.sum(np.diff(np.unwrap(loop)))
+                
+                if np.abs(winding) > np.pi:
+                    vortices.append([self.x[j], self.y[i]])
+        
+        return np.array(vortices)
+    
+    # --------------------------
+    # AI & ANALYSIS MODULES
+    # --------------------------
+    
+    def detect_anomalies(self):
+        """Detect anomalies using DBSCAN clustering"""
+        features = np.stack([
+            self.intensity.flatten(),
+            self.entropy_map.flatten(),
+            np.abs(self.phase_field).flatten()
+        ], axis=1)
+        
+        # Reduce dimensionality
+        pca = PCA(n_components=2)
+        reduced = pca.fit_transform(features)
+        
+        # Cluster
+        clustering = DBSCAN(eps=0.1, min_samples=10).fit(reduced)
+        anomalies = np.where(clustering.labels_ == -1)[0]
+        
+        # Convert to coordinates
+        coords = np.array([(self.x[i%self.grid_size], self.y[i//self.grid_size]) 
+                          for i in anomalies])
+        return coords
+    
+    def update_latent_space(self):
+        """Update latent space projection"""
+        # Prepare input
+        input_data = torch.tensor(self.intensity, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+        
+        # Process through autoencoder
+        with torch.no_grad():
+            _, latent = autoencoder(input_data)
+        
+        # Store in history
+        self.latent_history.append(latent.cpu().numpy().flatten())
+        
+        # Reduce to 2D if enough points
+        if len(self.latent_history) > 10:
+            tsne = TSNE(n_components=2)
+            reduced = tsne.fit_transform(np.array(self.latent_history[-100:]))
+            self.ax_latent.clear()
+            self.ax_latent.scatter(reduced[:,0], reduced[:,1], c=range(len(reduced)), cmap='viridis')
+            self.ax_latent.set_title('LATENT SPACE PROJECTION', fontsize=10, color='#aaddff')
+            self.ax_latent.set_xticks([])
+            self.ax_latent.set_yticks([])
+    
+    # --------------------------
+    # VISUALIZATION MODULES
+    # --------------------------
+    
+    def plot_3d_surface(self):
+        """Create 3D surface plot of coherence space"""
+        self.ax_3d.clear()
+        
+        # Create surface plot
+        x = np.linspace(-5, 5, 50)
+        y = np.linspace(-5, 5, 50)
+        X, Y = np.meshgrid(x, y)
+        
+        # Interpolate intensity onto coarser grid
+        points = np.array([self.X.flatten(), self.Y.flatten()]).T
+        values = self.intensity.flatten()
+        Z = griddata(points, values, (X, Y), method='cubic')
+        
+        # Plot surface
+        surf = self.ax_3d.plot_surface(X, Y, Z, cmap='plasma', 
+                                      rstride=1, cstride=1, alpha=0.8,
+                                      linewidth=0, antialiased=True)
+        self.ax_3d.set_title('3D COHERENCE SPACE', fontsize=10, color='#aaddff')
+        self.ax_3d.set_xticks([])
+        self.ax_3d.set_yticks([])
+        self.ax_3d.set_zticks([])
+    
+    def plot_field_lines(self):
+        """Visualize field lines using gradient of phase"""
+        self.ax_field.clear()
+        
+        # Compute gradients
+        grad_x, grad_y = np.gradient(self.phase_field)
+        
+        # Plot streamlines
+        self.ax_field.streamplot(
+            self.X, self.Y, grad_x, grad_y, 
+            density=2, color=np.sqrt(grad_x**2 + grad_y**2), 
+            cmap='viridis', linewidth=1)
+        
+        self.ax_field.set_title('FIELD LINE TRACER', fontsize=10, color='#aaddff')
+        self.ax_field.set_xticks([])
+        self.ax_field.set_yticks([])
+    
+    def plot_latent_space(self):
+        """Initialize latent space plot"""
+        self.ax_latent.set_title('LATENT SPACE PROJECTION', fontsize=10, color='#aaddff')
+        self.ax_latent.set_xticks([])
+        self.ax_latent.set_yticks([])
+        self.ax_latent.text(0.5, 0.5, 'Collecting data...', 
+                           ha='center', va='center', color='white')
+    
+    # --------------------------
+    # EXPERIMENTATION TOOLS
+    # --------------------------
+    
+    def load_cosmic_data(self, event):
+        """Load real astronomical data"""
+        try:
+            # Download Gaia data (simplified example)
+            url = "https://cdn.jsdelivr.net/gh/astropy/astropy-data@master/coordinates/samples/gaia_rotation.fits"
+            response = requests.get(url)
+            hdul = fits.open(BytesIO(response.content))
+            
+            # Extract coordinates
+            data = hdul[1].data
+            ra = data['ra']
+            dec = data['dec']
+            
+            # Convert to simulation coordinates (simplified)
+            x = (ra - np.mean(ra)) * 10
+            y = (dec - np.mean(dec)) * 10
+            
+            # Update sources
+            self.num_sources = len(x)
+            self.source_positions = np.column_stack([x, y])
+            self.source_phases = np.random.rand(self.num_sources) * 2 * np.pi
+            self.source_colors = plt.cm.hsv(np.linspace(0, 1, self.num_sources))
+            
+            # Add log entry
+            self.add_log_entry(f"Loaded Gaia dataset with {self.num_sources} sources")
+            
+            # Redraw
+            self.redraw()
+        except Exception as e:
+            print(f"Error loading cosmic data: {e}")
+    
+    def on_click(self, event):
+        """Handle click events for perturbations"""
+        if event.inaxes == self.ax_main:
+            # Get click position
+            x, y = event.xdata, event.ydata
+            
+            # Find nearest oscillator
+            distances = np.sqrt((self.source_positions[:,0]-x)**2 + 
+                               (self.source_positions[:,1]-y)**2)
+            idx = np.argmin(distances)
+            
+            # Apply perturbation
+            self.source_phases[idx] += np.pi/2  # 90° phase shift
+            self.add_log_entry(f"Applied perturbation at ({x:.2f}, {y:.2f})")
+            
+            # Redraw
+            self.redraw()
+    
+    def activate_perturb_mode(self, event):
+        """Activate perturbation mode"""
+        self.add_log_entry("Perturbation mode activated - click on lattice to inject phase pulse")
+    
+    # --------------------------
+    # CONTROL & UI FUNCTIONS
+    # --------------------------
+    
+    def update_params(self, val):
+        """Update parameters from sliders"""
+        self.coherence = self.slider_coherence.val
+        self.wavelength = self.slider_wavelength.val
+        self.node_threshold = self.slider_threshold.val
+        self.simulation_speed = self.slider_speed.val
+        self.phase_drift_rate = self.slider_drift.val
+        self.noise_level = self.slider_noise.val
+        self.coupling_strength = self.slider_coupling.val
+        self.redraw()
+    
+    def toggle_features(self, label):
+        """Toggle visualization features"""
+        if label == 'Entropy Overlay':
+            self.entropy_overlay = not self.entropy_overlay
+        elif label == 'Phase Drift':
+            self.phase_drift_enabled = not self.phase_drift_enabled
+        elif label == 'AI Detection':
+            # Implement AI detection
+            anomalies = self.detect_anomalies()
+            self.ax_main.scatter(anomalies[:,0], anomalies[:,1], s=30, c='yellow', marker='*')
+        elif label == 'Vortex Tracking':
+            self.vortex_points = self.detect_vortices()
+            self.ax_main.scatter(self.vortex_points[:,0], self.vortex_points[:,1], 
+                                s=50, c='red', marker='x')
+        elif label == 'Field Lines':
+            self.plot_field_lines()
+        elif label == '3D Surface':
+            self.plot_3d_surface()
+        self.redraw()
+    
+    def randomize_lattice(self, event):
+        """Randomize oscillator positions"""
+        self.source_positions = np.random.rand(self.num_sources, 2) * 8 - 4
+        self.source_phases = np.random.rand(self.num_sources) * 2 * np.pi
+        self.add_log_entry("Lattice randomized")
+        self.redraw()
+    
+    def toggle_recording(self, event):
+        """Toggle GIF recording"""
+        self.recording = not self.recording
+        if not self.recording and self.frames:
+            self.save_gif()
+            self.frames = []
+    
+    def save_experiment(self, event):
+        """Save current experiment state"""
+        # Create timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save parameters and logs
+        params = {
+            'coherence': self.coherence,
+            'wavelength': self.wavelength,
+            'threshold': self.node_threshold,
+            'drift_rate': self.phase_drift_rate,
+            'noise_level': self.noise_level,
+            'coupling': self.coupling_strength,
+            'notes': self.text_box.text
+        }
+        pd.DataFrame([params]).to_csv(f"naomi_experiment_{timestamp}.csv", index=False)
+        
+        # Save current frame
+        self.fig.savefig(f"naomi_snapshot_{timestamp}.png", dpi=150)
+        
+        self.add_log_entry(f"Experiment saved as naomi_experiment_{timestamp}")
+    
+    def add_log_entry(self, text):
+        """Add entry to logbook"""
+        current_text = self.text_box.text
+        if current_text == "Experiment notes...":
+            current_text = ""
+        self.text_box.set_val(current_text + f"\n{datetime.now().strftime('%H:%M:%S')}: {text}")
+    
+    def set_frame(self, val):
+        """Set current frame for playback"""
+        self.current_frame = int(val)
+        if self.current_frame < len(self.frame_buffer):
+            # Restore frame
+            pass  # Implementation would restore from buffer
+    
+    def play_animation(self, event):
+        """Play animation from current frame"""
+        pass  # Implementation would control animation state
+    
+    def pause_animation(self, event):
+        """Pause animation"""
+        pass  # Implementation would pause animation
+    
+    # --------------------------
+    # MAIN SIMULATION LOOP
+    # --------------------------
+    
+    def redraw(self):
+        """Redraw all visualization elements"""
+        # Apply phase drift if enabled
+        if self.phase_drift_enabled:
+            self.source_phases[:] = (self.source_phases + self.phase_drift_rate) % (2 * np.pi)
+        
+        # Update field
+        self.field = self.update_field()
+        self.dark_nodes, self.intensity = self.detect_dark_nodes(self.field)
+        self.phase_field = np.angle(self.field)
+        self.entropy_map = self.compute_entropy(self.field)
+        self.spectrum = self.compute_spectrum()
+        
+        # Update main plot
+        if self.mode == 'intensity':
+            self.main_plot.set_data(self.intensity)
+            self.main_plot.set_clim(vmin=0, vmax=np.percentile(self.intensity, 99))
+        else:
+            self.main_plot.set_data(self.phase_field)
+            self.main_plot.set_clim(vmin=-np.pi, vmax=np.pi)
+        
+        # Update entropy overlay
+        self.entropy_overlay_plot.set_data(self.entropy_map)
+        self.entropy_overlay_plot.set_alpha(0.5 if self.entropy_overlay else 0.0)
+        
+        # Update phase plot
+        self.phase_plot.set_data(self.phase_field)
+        
+        # Update entropy plot
+        self.entropy_plot.set_data(self.entropy_map)
+        
+        # Update spectral analysis
+        self.spectrum_plot.set_data(np.log1p(np.abs(self.spectrum)))
+        
+        # Update dark nodes
+        for coll in self.node_plot.collections:
+            coll.remove()
+        new_nodes = self.ax_main.contour(
+            self.X, self.Y, self.dark_nodes, 
+            levels=[0.5], colors='cyan', linewidths=1.5)
+        self.node_plot.collections = new_nodes.collections
+        
+        # Update sources
+        self.source_plot.set_offsets(self.source_positions)
+        
+        # Update time chart
+        self.coherence_history.append(self.coherence)
+        self.entropy_history.append(np.mean(self.entropy_map))
+        if len(self.coherence_history) > 100:
+            self.coherence_history.pop(0)
+            self.entropy_history.pop(0)
+        self.time_line.set_data(range(len(self.coherence_history)), self.coherence_history)
+        self.entropy_line.set_data(range(len(self.entropy_history)), self.entropy_history)
+        self.ax_time.set_xlim(0, len(self.coherence_history))
+        
+        # Update 3D surface
+        self.plot_3d_surface()
+        
+        # Update vortex detection
+        self.vortex_points = self.detect_vortices()
+        self.ax_vortex.clear()
+        self.ax_vortex.imshow(self.intensity, extent=[-5,5,-5,5], cmap='gray', origin='lower')
+        self.ax_vortex.scatter(self.vortex_points[:,0], self.vortex_points[:,1], 
+                              s=50, c='red', marker='x')
+        
+        # Update field lines
+        self.plot_field_lines()
+        
+        # Update latent space
+        self.update_latent_space()
+        
+        # Add to frame buffer
+        if self.recording:
+            self.fig.canvas.draw()
+            frame = np.frombuffer(self.fig.canvas.tostring_rgb(), dtype=np.uint8)
+            frame = frame.reshape(self.fig.canvas.get_width_height()[::-1] + (3,))
+            self.frames.append(frame)
+        
+        self.fig.canvas.draw_idle()
+    
+    def start_animation(self):
+        """Start the simulation animation"""
+        self.ani = FuncAnimation(self.fig, self.animate, interval=50, blit=False)
+        plt.show()
+    
+    def animate(self, frame):
+        """Animation update function"""
+        self.time_shift += 0.05 * self.simulation_speed
+        self.redraw()
+        return None
+
+# Start the simulation
+sim = NaomiSOLSimulator()
